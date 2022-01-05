@@ -24,16 +24,27 @@
 #define PORT 8080
 #define SSL_KEY_FILE ""
 #define SSL_CERT_FILE ""
+#define NUM_THREADS 8
 
 /* Create different kinds of servers. */
 #define SOCKTYPE_OFFSET 0
 #define STREAMTYPE_OFFSET 1
+#define HANDLE_OFFSET 2
+#define GET_USING_UDP(config) ((config >> SOCKTYPE_OFFSET) & 1)
+#define GET_USING_TLS(config) ((config >> STREAMTYPE_OFFSET) & 1)
+#define GET_USING_HTTP(config) ((config >> HANDLE_OFFSET) & 1)
+
 #define USE_TCP (0 << SOCKTYPE_OFFSET)
 #define USE_UDP (1 << SOCKTYPE_OFFSET)
-#define USE_RAW_CONN (0 << STREAMTYPE_OFFSET)
+#define USE_UNENCRYPTED (0 << STREAMTYPE_OFFSET)
 #define USE_SSL_TLS (1 << STREAMTYPE_OFFSET)
-#define USE_HTTP_SERVER (USE_TCP | USE_RAW_CONN)
-#define USE_HTTPS_SERVER (USE_TCP | USE_SSL_TLS)
+#define HANDLE_RAW_CONN (0 << HANDLE_OFFSET)
+#define HANDLE_HTTP_CONN (1 << HANDLE_OFFSET)
+
+#define USE_HTTP_SERVER (USE_TCP | USE_UNENCRYPTED | HANDLE_HTTP_CONN)
+#define USE_HTTPS_SERVER (USE_TCP | USE_SSL_TLS | HANDLE_HTTP_CONN)
+#define USE_TLS_SERVER (USE_TCP | USE_SSL_TLS | HANDLE_RAW_CONN)
+#define USE_UDP_SERVER (USE_UDP | USE_UNENCRYPTED | HANDLE_RAW_CONN)
 
 #define PRINT_START_MESSAGE 1
 #define MAX_MSG_LEN 99999
@@ -57,10 +68,17 @@ typedef char ConnectionBuffer;
 typedef char ResponseBuffer;
 
 /* Creating the server */
+typedef struct {
+  fd_t sock_fd
+  ServerConfig config;
+  SSL_CTX* ctx;
+} Server;
+
 static inline fd_t startServer(int port, ServerConfig config);
 static inline void serverStartListening(fd_t sock_fd, ServerConfig config);
 static inline void* handleConnection(void* cli_fd);
 static inline SSL_CTX* create_ssl_context(void);
+
 
 /* Classes */
 struct Arena;
@@ -115,13 +133,10 @@ static inline void handleBadRequest(void);
 static inline void handleUnimplementedMethod(HTTPRequest* request);
 
 /* Building responses */
-static inline int bufferWouldOverflow(size_t current_size, size_t max_size,
-                                      size_t to_append);
+static inline int bufferWouldOverflow(size_t current_size, size_t max_size, size_t to_append);
 static inline void flushResponseBuffer(ResponseBuffer* buf, size_t size);
-static inline void appendToResponse(ResponseBuffer* buf, char* to_append,
-                                    size_t len);
-static inline void appendLineToResponse(ResponseBuffer* buf, char* line,
-                                        size_t len);
+static inline void appendToResponse(ResponseBuffer* buf, char* to_append, size_t len);
+static inline void appendLineToResponse(ResponseBuffer* buf, char* line, size_t len);
 static inline void appendToResponseFmt(ResponseBuffer* buf, char* fmt, ...);
 
 /********/
@@ -130,14 +145,14 @@ static inline void appendToResponseFmt(ResponseBuffer* buf, char* fmt, ...);
 
 int
 main(void) {
-    fd_t listenfd;
+    fd_t sock_fd;
     ServerConfig config;
 
     config = USE_HTTP_SERVER;
 
-    listenfd = startServer(PORT, config);
+    sock_fd = startServer(PORT, config);
 
-    serverStartListening(listenfd, config);
+    serverStartListening(sock_fd, config);
 
     return 0;
 }
@@ -152,7 +167,7 @@ startServer(int port, ServerConfig config) {
     struct sockaddr_in addr;
     fd_t sock_fd;
 
-    using_udp = (config >> 0) & 0x1;
+    using_udp = GET_USING_UDP(config);
     addr.sin_family = AF_INET;
     addr.sin_port = htons(PORT);
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
@@ -198,7 +213,7 @@ serverStartListening(fd_t sock_fd, ServerConfig config) {
     /* Assert that time will work past the year 2038 while we're at it. */
     assert((sizeof(time_t) > ((32 / CHAR_BIT) + (32 % CHAR_BIT != 0))));
 
-    using_tls = (config >> 1) & 0x1;
+    using_tls = GET_USING_TLS(config);
     addrlen = sizeof(socklen_t);
 
     for (;;) {
@@ -288,44 +303,56 @@ appendToResponseFmt(ResponseBuffer* buf, char* fmt, ...) {}
 
 static inline void*
 handleConnection(void* conv) {
+    ConnectionBuffer mesg[MAX_MSG_LEN + 1];
     ssize_t rcvd;
-    char mesg[MAX_MSG_LEN + 1];
-    char path[MAX_REQUEST_PATH_LEN + 1] = ROOT;
     int bytes_read;
     ServerConfig config;
     fd_t cli_fd;
     size_t resp_len;
+    int using_tls;
+    llhttp_t parser;
+    llhttp_settings_t settings;
+    SSL_CTX* ctx;
+    SSL* ssl;
 
     cli_fd = (fd_t)((intptr_t)conv >> 0);
     config = (ServerConfig)((intptr_t)conv >> 32);
+    using_tls = GET_USING_TLS(config);
+    using_http = GET_USING_HTTP(config);
+
     pthread_detach(pthread_self());
 
-    rcvd = recv(cli_fd, mesg, MAX_MSG_LEN, 0);
-    if (rcvd < 0) {
-        fprintf(stderr, ("recv() error\n"));
-        goto cleanup;
-    } else if (rcvd == 0) {
-        fprintf(stderr, "Client disconnected upexpectedly.\n");
-        goto cleanup;
+    /* If this is an HTTP server, initialize the parser. */
+    if (using_http) {
+        settings.on_url = print_callback;
+        settings.on_header_field = print_callback;
+        settings.on_header_value = print_callback;
+        settings.on_status = print_callback;
+        settings.on_body = print_callback;
+
+        llhttp_settings_init(&settings);
+        llhttp_init(&parser, HTTP_REQUEST, &settings);
     }
-    mesg[rcvd] = '\0';  // Null terminate it.
 
-    printf("MESSAGE:\n");
-    printf("%s", mesg);
+    /* If this connection uses TLS (SSL), create an SSL context as well. */
+    if (using_tls) {
+       ctx = create_ssl_context();
+       ssl = SSL_new(ctx);
+       SSL_set_fd(cli_fd);
+    }
 
-    llhttp_t parser;
-    llhttp_settings_t settings;
-    /* Initialize user callbacks and settings */
-    llhttp_settings_init(&settings);
+    do {
+       /* Read from the connection into the buffer. */
+        rcvd = recv(cli_fd, mesg, MAX_MSG_LEN, 0);
+        if (rcvd < 0) {
+            fprintf(stderr, ("recv() error\n"));
+            goto cleanup;
+        } else if (rcvd == 0) {
+            fprintf(stderr, "Client disconnected upexpectedly.\n");
+            goto cleanup;
+        }
+    } while(rcvd);
 
-    settings.on_url = print_callback;
-    settings.on_header_field = print_callback;
-    settings.on_header_value = print_callback;
-    settings.on_status = print_callback;
-    settings.on_body = print_callback;
-    settings.on_url = print_callback;
-
-    llhttp_init(&parser, HTTP_REQUEST, &settings);
 
     enum llhttp_errno err = llhttp_execute(&parser, mesg, rcvd);
     if (err != HPE_OK) {
@@ -370,6 +397,7 @@ static inline Arena*
 Arena_create(Arena* prev) {
     Arena* new_arena;
     new_arena = (Arena*)malloc(ARENA_SIZE);
+    if (!new_arena) return NULL;
     new_arena->next = NULL;
     new_arena->size = 0;
 
