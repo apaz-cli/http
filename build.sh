@@ -8,4 +8,4 @@ if [ "$1" = "full" ]; then
   cd ..
 fi
 
-cc -O3 -march=native -pthread http.c llhttp/build/libllhttp.a
+cc http.c -O3 -march=native -pthread -lssl -lcrypto llhttp/build/libllhttp.a

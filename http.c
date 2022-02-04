@@ -30,28 +30,33 @@
 #define SOCKTYPE_OFFSET 0
 #define STREAMTYPE_OFFSET 1
 #define HANDLE_OFFSET 2
+
 #define GET_USING_UDP(config) ((config >> SOCKTYPE_OFFSET) & 1)
 #define GET_USING_TLS(config) ((config >> STREAMTYPE_OFFSET) & 1)
 #define GET_USING_HTTP(config) ((config >> HANDLE_OFFSET) & 1)
 
-#define USE_TCP (0 << SOCKTYPE_OFFSET)
-#define USE_UDP (1 << SOCKTYPE_OFFSET)
-#define USE_UNENCRYPTED (0 << STREAMTYPE_OFFSET)
-#define USE_SSL_TLS (1 << STREAMTYPE_OFFSET)
-#define HANDLE_RAW_CONN (0 << HANDLE_OFFSET)
-#define HANDLE_HTTP_CONN (1 << HANDLE_OFFSET)
+#define CONFIG_TCP (0 << SOCKTYPE_OFFSET)
+#define CONFIG_UDP (1 << SOCKTYPE_OFFSET)
+#define CONFIG_UNENCRYPTED (0 << STREAMTYPE_OFFSET)
+#define CONFIG_SSL_TLS (1 << STREAMTYPE_OFFSET)
+#define CONFIG_RAW_CONN (0 << HANDLE_OFFSET)
+#define CONFIG_HTTP_CONN (1 << HANDLE_OFFSET)
 
-#define USE_HTTP_SERVER (USE_TCP | USE_UNENCRYPTED | HANDLE_HTTP_CONN)
-#define USE_HTTPS_SERVER (USE_TCP | USE_SSL_TLS | HANDLE_HTTP_CONN)
-#define USE_TLS_SERVER (USE_TCP | USE_SSL_TLS | HANDLE_RAW_CONN)
-#define USE_UDP_SERVER (USE_UDP | USE_UNENCRYPTED | HANDLE_RAW_CONN)
+#define HTTP_SERVER_CONFIG (CONFIG_TCP | CONFIG_UNENCRYPTED | CONFIG_HTTP_CONN)
+#define HTTPS_SERVER_CONFIG (CONFIG_TCP | CONFIG_SSL_TLS | CONFIG_HTTP_CONN)
+#define TLS_SERVER_CONFIG (CONFIG_TCP | CONFIG_SSL_TLS | CONFIG_RAW_CONN)
+#define UDP_SERVER_CONFIG (CONFIG_UDP | CONFIG_UNENCRYPTED | CONFIG_RAW_CONN)
 
 #define PRINT_START_MESSAGE 1
 #define MAX_MSG_LEN 99999
-#define MAX_REQUEST_PATH_LEN 2048
-#define MAX_QUEUED_CONNECTIONS 1000
-#define ARENA_SIZE (4096 * 10)
-#define RESPONSE_BUFFER_SIZE (4096 * 10)
+#define MAX_QUEUED_CONNECTIONS 10000
+#define PAGE_SIZE 4096
+#define HTTP_VERSION_SIZE 16
+#define MAX_REQUEST_PATH_LEN (PAGE_SIZE / 2)
+#define ARENA_SIZE (PAGE_SIZE * 10)
+#define ARENA_BUF_SIZE (ARENA_SIZE - (sizeof(void*) + sizeof(size_t)))
+#define RESPONSE_BUFFER_SIZE (PAGE_SIZE * 10)
+#define RAW_REQUEST_INITIAL_SIZE (PAGE_SIZE * 3)
 
 #ifdef __GNUC__
 #define LIKELY(expr) __builtin_expect(!!(expr), 1)
@@ -66,24 +71,22 @@ typedef int ServerConfig;
 typedef int fd_t;
 typedef char ConnectionBuffer;
 typedef char ResponseBuffer;
-
-/* Creating the server */
 typedef struct {
-  fd_t sock_fd
-  ServerConfig config;
-  SSL_CTX* ctx;
-} Server;
+    char* buf;
+    size_t size;
+    size_t cap;
+} BufferHandle;
+typedef struct {
+    char* buf;
+    size_t size;
+    size_t cap;
+    ServerConfig config;
+    SSL* ssl;
+} ResponseBufferHandle;
 
-static inline fd_t startServer(int port, ServerConfig config);
-static inline void serverStartListening(fd_t sock_fd, ServerConfig config);
-static inline void* handleConnection(void* cli_fd);
-static inline SSL_CTX* create_ssl_context(void);
-
-
-/* Classes */
+/* Objects to write code to handle */
 struct Arena;
 typedef struct Arena Arena;
-#define ARENA_BUF_SIZE (ARENA_SIZE - (sizeof(Arena*) + sizeof(size_t)))
 struct Arena {
     Arena* next;
     size_t size;
@@ -96,9 +99,15 @@ static inline void* Arena_alloc(Arena* on, size_t size);
 typedef struct {
     fd_t cli_fd;
     ServerConfig config;
-    char request_url[MAX_REQUEST_PATH_LEN];
-    llhttp_method_t method;
+} RawRequest;
+typedef struct {
+    fd_t cli_fd;
+    ServerConfig config;
 
+    char version[HTTP_VERSION_SIZE];
+    char request_url[MAX_REQUEST_PATH_LEN];
+
+    llhttp_method_t method;
     struct {
         size_t* name_offsets;
         size_t* value_offsets;
@@ -107,48 +116,56 @@ typedef struct {
     } request_headers;
 
     size_t response_size;
-    ResponseBuffer response[RESPONSE_BUFFER_SIZE];
+    ResponseBuffer* response_buffer;
 
     Arena arena;
 } HTTPRequest;
 static inline void HTTPRequest_create(HTTPRequest* req);
 static inline void HTTPRequest_destroy(HTTPRequest* req);
 
-/* Handling requests */
-/* You can use your own request handlers, or use these ones. */
-typedef void (*requestHandler)(HTTPRequest* request);
-static inline void translateTLSBuffer(ConnectionBuffer* buf, SSL_CTX* ctx);
-static inline void handleHTTPBuffer(ConnectionBuffer* buf, HTTPRequest* req);
-static inline void handleGET(HTTPRequest* request);
-static inline void handleHEAD(HTTPRequest* request);
-static inline void handlePOST(HTTPRequest* request);
-static inline void handlePUT(HTTPRequest* request);
-static inline void handleDELETE(HTTPRequest* request);
-static inline void handleCONNECT(HTTPRequest* request);
-static inline void handleOPTIONS(HTTPRequest* request);
-static inline void handleTRACE(HTTPRequest* request);
-static inline void handlePATCH(HTTPRequest* request);
+/* Assert that argument packing a void* will work. Also assert
+   that time will work past the year 2038 and Arena size is right. */
+_Static_assert((sizeof(void*) == (sizeof(fd_t) + sizeof(ServerConfig))), "Packing a void* will not work.");
+_Static_assert((sizeof(uintptr_t) == (sizeof(fd_t) + sizeof(ServerConfig))), "Packing a void* will not work.");
+_Static_assert((sizeof(time_t) > ((32 / CHAR_BIT) + (32 % CHAR_BIT != 0))), "Time will not work past the year 2038.");
+_Static_assert(sizeof(Arena) == ARENA_SIZE, "sizeof(void*) != sizeof(Arena*)? Odd padding issues?");
 
-static inline void handleBadRequest(void);
-static inline void handleUnimplementedMethod(HTTPRequest* request);
+/* Main API */
+/* Creating the server */
+static inline fd_t startServer(int port, ServerConfig config);
+static inline void serverStartListening(fd_t sock_fd, ServerConfig config);
+static inline void* handleConnection(void* cli_fd);
+static inline SSL_CTX* create_ssl_context(const char* key_file, const char* cert_file);
 
-/* Building responses */
-static inline int bufferWouldOverflow(size_t current_size, size_t max_size, size_t to_append);
-static inline void flushResponseBuffer(ResponseBuffer* buf, size_t size);
-static inline void appendToResponse(ResponseBuffer* buf, char* to_append, size_t len);
-static inline void appendLineToResponse(ResponseBuffer* buf, char* line, size_t len);
-static inline void appendToResponseFmt(ResponseBuffer* buf, char* fmt, ...);
+/* Handle requests */
+/* You define a handler. Implement handleHTTPRequest() if you're using
+   HTTP/HTTPS, or handleRawRequest() if using a raw connection. */
+typedef void (*requestHandler)(void* request);
+static inline void handleHTTPRequest(HTTPRequest* request);
+static inline void handleRawRequest(RawRequest* request);
+
+/* Build a response */
+static inline int wouldOverflow(size_t into_size, size_t into_cap, size_t from_size);
+static inline int bufferWouldOverflow(BufferHandle into, BufferHandle from);
+static inline void flushResponseBuffer(ResponseBufferHandle h, ServerConfig config, SSL* ssl);
+static inline void appendToResponse(ResponseBufferHandle to, BufferHandle from);
+static inline void appendLineToResponse(ResponseBufferHandle to, BufferHandle from);
+static inline void appendToResponseFmt(ResponseBufferHandle buf, char* fmt, ...);
 
 /********/
 /* MAIN */
 /********/
 
+SSL_CTX* ctx;
+
 int
 main(void) {
     fd_t sock_fd;
-    ServerConfig config;
+    ServerConfig config = HTTP_SERVER_CONFIG;
 
-    config = USE_HTTP_SERVER;
+    if (GET_USING_TLS(config)) {
+        ctx = create_ssl_context(SSL_KEY_FILE, SSL_CERT_FILE);
+    }
 
     sock_fd = startServer(PORT, config);
 
@@ -163,7 +180,7 @@ main(void) {
 
 static inline fd_t
 startServer(int port, ServerConfig config) {
-    ServerConfig using_udp; /* 1 for UDP, 0 for TCP*/
+    ServerConfig using_udp;
     struct sockaddr_in addr;
     fd_t sock_fd;
 
@@ -189,9 +206,11 @@ startServer(int port, ServerConfig config) {
 
     if (PRINT_START_MESSAGE) {
         printf(
-            "\x1b[33mHTTP server started.\033[0m\n"
+            "\x1b[33m%s server started.\033[0m\n"
             "\x1b[35mPORT\033[0m: \033[92m%i\033[0m\n"
             "\x1b[35mROOT\033[0m: \033[92m%s\033[0m\n",
+            GET_USING_HTTP(config) ? (GET_USING_TLS(config) ? "HTTPS" : "HTTP")
+                                   : (GET_USING_TLS(config) ? "TLS" : (GET_USING_UDP(config) ? "UDP" : "TCP")),
             PORT, ROOT);
     }
 
@@ -206,12 +225,6 @@ serverStartListening(fd_t sock_fd, ServerConfig config) {
     fd_t cli_fd;
     ServerConfig using_tls;
     intptr_t packed_arg;
-
-    /* Assert that argument packing will work. */
-    assert((sizeof(void*) == (sizeof(fd_t) + sizeof(ServerConfig))));
-    assert((sizeof(uintptr_t) == (sizeof(fd_t) + sizeof(ServerConfig))));
-    /* Assert that time will work past the year 2038 while we're at it. */
-    assert((sizeof(time_t) > ((32 / CHAR_BIT) + (32 % CHAR_BIT != 0))));
 
     using_tls = GET_USING_TLS(config);
     addrlen = sizeof(socklen_t);
@@ -229,29 +242,28 @@ serverStartListening(fd_t sock_fd, ServerConfig config) {
 }
 
 static inline SSL_CTX*
-create_ssl_context(void) {
-    SSL_CTX* ctx;
+create_ssl_context(const char* key_file, const char* cert_file) {
+    SSL_CTX* ssl_ctx;
 
     /* Create SSL TLS context */
-    ctx = SSL_CTX_new(TLS_server_method());
-    if (!ctx) {
+    ssl_ctx = SSL_CTX_new(TLS_server_method());
+    if (!ssl_ctx) {
         perror("Unable to create SSL context");
         ERR_print_errors_fp(stderr);
         exit(1);
     }
 
     /* Set the key and cert */
-    if (SSL_CTX_use_certificate_file(ctx, SSL_CERT_FILE, SSL_FILETYPE_PEM) <=
-        0) {
+    if (SSL_CTX_use_certificate_file(ssl_ctx, SSL_CERT_FILE, SSL_FILETYPE_PEM) <= 0) {
         ERR_print_errors_fp(stderr);
         exit(1);
     }
-    if (SSL_CTX_use_PrivateKey_file(ctx, SSL_KEY_FILE, SSL_FILETYPE_PEM) <= 0) {
+    if (SSL_CTX_use_PrivateKey_file(ssl_ctx, SSL_KEY_FILE, SSL_FILETYPE_PEM) <= 0) {
         ERR_print_errors_fp(stderr);
         exit(1);
     }
 
-    return ctx;
+    return ssl_ctx;
 }
 
 static inline int
@@ -268,11 +280,10 @@ print_callback(llhttp_t* parser, const char* at, size_t length) {
 /************************************/
 
 const char* days[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
-const char* months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+const char* months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
 
 static inline void
-http_response_date_now(char* buf) {
+http_response_date_now(ResponseBufferHandle response) {
     struct tm tm;
     time_t now;
 
@@ -281,23 +292,31 @@ http_response_date_now(char* buf) {
 
     if (!gmtime_r(&now, &tm)) pthread_exit(NULL);
 
-    appendToResponseFmt(buf, "%s, %d %s %d %02d:%02d:%02d GMT",
-                        days[tm.tm_wday], tm.tm_mday, months[tm.tm_mon],
+#define TIME_TMP_BUF_SIZE 256
+    char timespace[TIME_TMP_BUF_SIZE];
+    int space = sprintf(timespace, "%s, %d %s %d %02d:%02d:%02d GMT", days[tm.tm_wday], tm.tm_mday, months[tm.tm_mon],
                         tm.tm_year + 1900, tm.tm_hour, tm.tm_min, tm.tm_sec);
+
+    BufferHandle handle = {timespace, (size_t)space, TIME_TMP_BUF_SIZE};
+    appendLineToResponse(response, handle);
 }
 
 static inline int
-bufferWouldOverflow(size_t current_size, size_t max_size, size_t to_append) {
-    return (current_size + to_append) >= max_size;
+wouldOverflow(size_t into_size, size_t into_cap, size_t from_size) {
+    return (into_size + from_size) > into_cap;
+}
+static inline int
+bufferWouldOverflow(BufferHandle into, BufferHandle from) {
+    return wouldOverflow(into.size, into.cap, from.size);
 }
 static inline void
-flushResponseBuffer(ResponseBuffer* buf, size_t size) {}
+flushResponseBuffer(ResponseBufferHandle h, ServerConfig config, SSL* ssl) {}
 static inline void
-appendToResponse(ResponseBuffer* buf, char* headers, size_t len) {}
+appendToResponse(ResponseBufferHandle to, BufferHandle from) {}
 static inline void
-appendLineToResponse(ResponseBuffer* buf, char* content, size_t len) {}
+appendLineToResponse(ResponseBufferHandle to, BufferHandle from) {}
 static inline void
-appendToResponseFmt(ResponseBuffer* buf, char* fmt, ...) {}
+appendToResponseFmt(ResponseBufferHandle buf, char* fmt, ...) {}
 
 /* Respond */
 
@@ -309,11 +328,17 @@ handleConnection(void* conv) {
     ServerConfig config;
     fd_t cli_fd;
     size_t resp_len;
-    int using_tls;
+    int using_tls, using_http;
+
     llhttp_t parser;
     llhttp_settings_t settings;
-    SSL_CTX* ctx;
+    enum llhttp_errno err;
     SSL* ssl;
+
+    // outputs
+    HTTPRequest request;
+    char* raw_request;
+    size_t raw_request_size;
 
     cli_fd = (fd_t)((intptr_t)conv >> 0);
     config = (ServerConfig)((intptr_t)conv >> 32);
@@ -321,6 +346,13 @@ handleConnection(void* conv) {
     using_http = GET_USING_HTTP(config);
 
     pthread_detach(pthread_self());
+
+    /* If this connection uses TLS (SSL), create an SSL object using the global
+     * context. */
+    if (using_tls) {
+        ssl = SSL_new(ctx);
+        SSL_set_fd(ssl, cli_fd);
+    }
 
     /* If this is an HTTP server, initialize the parser. */
     if (using_http) {
@@ -334,63 +366,48 @@ handleConnection(void* conv) {
         llhttp_init(&parser, HTTP_REQUEST, &settings);
     }
 
-    /* If this connection uses TLS (SSL), create an SSL context as well. */
-    if (using_tls) {
-       ctx = create_ssl_context();
-       ssl = SSL_new(ctx);
-       SSL_set_fd(cli_fd);
+    /* Initialize a buffer to copy the raw data from the client into. This is
+     * decoded first if using ssl/tls. It will be incorporated into the
+     * HTTPRequest object, or handled directly if a raw connection. */
+    raw_request_size = RAW_REQUEST_INITIAL_SIZE;
+    raw_request = malloc(RAW_REQUEST_INITIAL_SIZE);
+    if (using_http) {
+        HTTPRequest_create(&request);
     }
 
     do {
-       /* Read from the connection into the buffer. */
-        rcvd = recv(cli_fd, mesg, MAX_MSG_LEN, 0);
+        /* Read from the connection into the buffer. */
+        rcvd = using_tls ? SSL_read(ssl, mesg, MAX_MSG_LEN) : recv(cli_fd, mesg, MAX_MSG_LEN, 0);
         if (rcvd < 0) {
-            fprintf(stderr, ("recv() error\n"));
-            goto cleanup;
-        } else if (rcvd == 0) {
-            fprintf(stderr, "Client disconnected upexpectedly.\n");
+            fprintf(stderr, "Error reading from the connection.\n");
             goto cleanup;
         }
-    } while(rcvd);
 
+        /* Run it through the http parser. */
+        if (using_http) {
+            err = llhttp_execute(&parser, mesg, rcvd);
+            if (err != HPE_OK) {
+                fprintf(stderr, "Parse error: %s %s\n", llhttp_errno_name(err), parser.reason);
+                write(cli_fd, "HTTP/1.0 400 Bad Request\n", 25);
+                goto cleanup;
+            }
+        }
 
-    enum llhttp_errno err = llhttp_execute(&parser, mesg, rcvd);
-    if (err != HPE_OK) {
-        fprintf(stderr, "Parse error: %s %s\n", llhttp_errno_name(err),
-                parser.reason);
-        write(cli_fd, "HTTP/1.0 400 Bad Request\n", 25);
-        goto cleanup;
-    }
+        /* Append it to the buffer. */
+        
+
+    } while (rcvd);
+
     llhttp_finish(&parser);
 
     write(cli_fd, "HTTP/1.0 200 OK\r\n\r\n", 19);
     write(cli_fd, "This is a test.", 15);
 
 cleanup:;
-    write(cli_fd, "\r\n", 2);     // Write end of stream
     shutdown(cli_fd, SHUT_RDWR);  // Close the socket
     close(cli_fd);                // Free the file descriptor
     return NULL;                  // Kill the thread (detached)
 }
-
-static inline void
-handleGET(HTTPRequest* request) {}
-static inline void
-handleHEAD(HTTPRequest* request) {}
-static inline void
-handlePOST(HTTPRequest* request) {}
-static inline void
-handlePUT(HTTPRequest* request) {}
-static inline void
-handleDELETE(HTTPRequest* request) {}
-static inline void
-handleCONNECT(HTTPRequest* request) {}
-static inline void
-handleOPTIONS(HTTPRequest* request) {}
-static inline void
-handleTRACE(HTTPRequest* request) {}
-static inline void
-handlePATCH(HTTPRequest* request) {}
 
 /* Arena */
 static inline Arena*
@@ -400,8 +417,6 @@ Arena_create(Arena* prev) {
     if (!new_arena) return NULL;
     new_arena->next = NULL;
     new_arena->size = 0;
-
-    assert(sizeof(Arena) == ARENA_SIZE);
     if (prev) prev->next = new_arena;
 
     return new_arena;
@@ -418,8 +433,15 @@ Arena_destroy(Arena* to_free) {
 static inline void*
 Arena_alloc(Arena* on, size_t size) {
     char* ret;
-    if (bufferWouldOverflow(on->size, ARENA_BUF_SIZE, size))
+    BufferHandle into, from;
+
+    into.cap = ARENA_BUF_SIZE;
+    into.size = on->size;
+    from.size = size;
+
+    if (bufferWouldOverflow(into, from)) {
         on = Arena_create(on);
+    }
 
     ret = on->buf + on->size;
     on->size += size;
